@@ -200,6 +200,7 @@ class TrendAnalyzer:
         【真题片段】：
         {text[:800]}  (限制800字以防超长，但保证核心信息)
         """
+        # 上面要求最多提取2个考点，而且限制了文字长度，所以还是不够精准；
         
         from llama_index.core import PromptTemplate
         prompt = PromptTemplate(prompt_text)
@@ -207,6 +208,7 @@ class TrendAnalyzer:
         try:
             response = Settings.llm.complete(prompt.format())
             keywords_str = response.text.strip()
+            # 清洗数据：处理中文逗号和换行
             keywords = [k.strip() for k in keywords_str.replace('，', ',').replace('\n', ',').split(',') if len(k.strip()) > 2]
             return keywords
         except Exception as e:
@@ -360,7 +362,7 @@ class TrendAnalyzer:
             print("   (未匹配到具体原文)")
 
         # ================= 步骤 6: 智能押题 =================
-        print("\n🔮【维度四】2025 年押题预测引擎启动...")
+        print("\n🔮【维度四】2026 年押题预测引擎启动...")
         self.generate_smart_prediction(most_common, keywords_by_year, years)
 
     def generate_smart_prediction(self, common_topics, keywords_by_year, years):
@@ -387,10 +389,10 @@ class TrendAnalyzer:
         【命题规律逻辑】
         1. **重者恒重**：连续多年高频的考点，明年大概率继续考（尤其是案例题）。
         2. **冷热交替**：如果某考点去年考得特别多，今年可能略减；如果某重要考点连续2年未出现，今年极大概率“回补”。
-        3. **新纲新点**：结合2024-2025教材变动（虽然此处无具体教材数据，请依据常识推断新技术、新规范）。
+        3. **新纲新点**：结合2025-2026教材变动（虽然此处无具体教材数据，请依据常识推断新技术、新规范）。
         
         【任务】
-        请预测 2025 年最可能考的 3 个【案例分析大题】方向。
+        请预测 2026 年最可能考的 3 个【案例分析大题】方向。
         
         【输出格式】
         1. **预测考点**：[名称]
@@ -406,7 +408,7 @@ class TrendAnalyzer:
         try:
             response = Settings.llm.complete(prompt.format())
             print("\n" + "="*60)
-            print("💡【2025 年一建·终极押题报告】")
+            print("💡【2026 年一建·终极押题报告】")
             print("="*60)
             print(response.text)
             print("="*60)
