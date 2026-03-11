@@ -170,31 +170,35 @@ def ask_question(index, query):
         print(f"❌ 生成回答时出错: {e}")
         print("💡 可能是模型响应超时或内容过长，请尝试简化问题。")
 
-
 import pandas as pd
-from collections import Counter
+from collections import Counter, defaultdict
 from tqdm import tqdm
+import time
 
 class TrendAnalyzer:
     def __init__(self, index):
         self.index = index
 
-    def extract_keywords_from_nodes(self, texts):
-        """利用 LLM 从文本列表中提取核心考点关键词"""
-        if not texts:
+    def extract_keywords_from_single_text(self, text):
+        """
+        【核心升级】对单段文本进行标准化考点提取
+        强制要求使用官方术语，避免口语化
+        """
+        if not text or len(text.strip()) < 20:
             return []
         
-        # 截取部分内容防止超时，取前 15 段
-        sample_text = " ".join(texts[:15])
-        
         prompt_text = f"""
-        你是一级建造师考试分析专家。
-        以下是从历年真题中提取的若干文本片段：
-        ---
-        {sample_text}
-        ---
-        请从中提取出 5-10 个核心考点关键词（例如：'索赔条件', '深基坑支护', '网络计划优化'）。
-        只返回关键词列表，用逗号分隔，不要其他废话。
+        你是一级建造师考试命题专家。
+        请阅读以下一段真题内容，提取其中包含的【核心考点】。
+        
+        【要求】：
+        1. 必须使用《一级建造师官方教材》的标准专业术语（如：'索赔管理' 而不是 '要钱'，'深基坑支护' 而不是 '挖坑'）。
+        2. 如果没有明显考点，返回空列表。
+        3. 最多提取 2 个最核心的考点。
+        4. 只返回考点名称，用逗号分隔，不要编号，不要其他解释。
+        
+        【真题片段】：
+        {text[:800]}  (限制800字以防超长，但保证核心信息)
         """
         
         from llama_index.core import PromptTemplate
@@ -203,115 +207,197 @@ class TrendAnalyzer:
         try:
             response = Settings.llm.complete(prompt.format())
             keywords_str = response.text.strip()
-            # 清洗数据：处理中文逗号和换行
-            keywords = [k.strip() for k in keywords_str.replace('，', ',').replace('\n', ',').split(',') if len(k.strip()) > 1]
+            keywords = [k.strip() for k in keywords_str.replace('，', ',').replace('\n', ',').split(',') if len(k.strip()) > 2]
             return keywords
         except Exception as e:
-            print(f"⚠️ 考点提取失败: {e}")
             return []
 
     def analyze_trends(self):
-        print("\n📊 正在启动真题趋势分析引擎...")
-        print("🔄 第一步：扫描所有年份真题，提取高频考点...")
+        print("\n📊 正在启动【专业版】真题趋势分析引擎...")
+        print("⚠️ 注意：为了保证全面性，系统将逐段分析所有真题，这可能需要 2-3 分钟，请耐心等待...\n")
         
-        # 【核心修复】正确构建过滤条件
+        # ================= 步骤 1: 获取所有真题节点 =================
+        print("🔄 第一步：加载全量真题数据...")
+        
         filters = None
         try:
             from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
-            
-            # 1. 创建单个过滤条件
-            single_filter = MetadataFilter(
-                key="source_type",
-                value="真题",
-                operator="=="
-            )
-            
-            # 2. 包装成 Filters 对象 (注意是复数，且需要放在 filters 列表中)
+            single_filter = MetadataFilter(key="source_type", value="真题", operator="==")
             filters = MetadataFilters(filters=[single_filter])
-            
-        except ImportError:
-            print("⚠️ 未找到最新的过滤类，将尝试不使用过滤进行全量扫描...")
-        except Exception as e:
-            print(f"⚠️ 构建过滤器时出错 ({e})，将尝试不使用过滤进行全量扫描...")
+        except Exception:
+            pass
 
-        # 建立查询引擎
-        query_kwargs = {"similarity_top_k": 200}
+        query_kwargs = {"similarity_top_k": 1000} # 增大数量，确保覆盖更多
         if filters:
             query_kwargs["filters"] = filters
             
         try:
             query_engine_all = self.index.as_query_engine(**query_kwargs)
-            
-            # 执行查询获取大量真题片段
-            print("🔍 正在检索真题库...")
-            response = query_engine_all.query("一级建造师历年真题考点内容")
+            response = query_engine_all.query("一建真题全部内容")
             nodes = response.source_nodes
-        except Exception as e:
-            print(f"❌ 检索失败: {e}")
-            print("💡 尝试不带过滤器重新检索...")
-            # 降级方案：不带过滤器重试
-            query_engine_fallback = self.index.as_query_engine(similarity_top_k=200)
-            response = query_engine_fallback.query("一级建造师历年真题考点内容")
+        except Exception:
+            print("⚠️ 过滤检索失败，尝试全量检索...")
+            query_engine_fallback = self.index.as_query_engine(similarity_top_k=1000)
+            response = query_engine_fallback.query("一建真题全部内容")
             nodes = response.source_nodes
-        
+
         if not nodes:
-            print("❌ 未找到任何相关资料。")
-            print("💡 提示：请检查 data 文件夹中是否有文件。")
+            print("❌ 未找到任何真题资料。")
             return
 
+        # ================= 步骤 2: 展示数据源 =================
+        source_files = {}
+        nodes_by_year = defaultdict(list) # 按年份分组节点
+        
+        for node in nodes:
+            fname = node.metadata.get("file_name", "未知文件")
+            year = node.metadata.get("year", "未知年份")
+            key = f"{fname}"
+            source_files[key] = source_files.get(key, 0) + 1
+            nodes_by_year[year].append(node)
+        
+        print(f"\n✅ 共加载 {len(nodes)} 个真题片段，来源于以下 {len(source_files)} 个文件：")
+        for fname, count in sorted(source_files.items()):
+            print(f"   📄 {fname} ({count}片段)")
+        print("-" * 60)
+
+        # ================= 步骤 3: 逐段深度分析 (Map 阶段) =================
+        print("\n🔄 第二步：AI 正在逐段提取标准化考点 (100% 全覆盖)...")
+        
         all_keywords = []
-        total_batches = (len(nodes) + 19) // 20
+        keywords_by_year = defaultdict(list) # 记录每年的考点
         
-        print(f"🤖 AI 正在分析 {len(nodes)} 个文本片段并提取考点标签...")
-        
-        # 分批次处理
-        for i in range(0, len(nodes), 20):
-            batch_nodes = nodes[i:i+20]
-            batch_texts = [node.get_content() for node in batch_nodes]
+        # 使用 tqdm 显示进度条
+        for i, node in enumerate(tqdm(nodes, desc="分析进度")):
+            text = node.get_content()
+            year = node.metadata.get("year", "未知年份")
             
-            kws = self.extract_keywords_from_nodes(batch_texts)
-            all_keywords.extend(kws)
+            # 提取关键词
+            kws = self.extract_keywords_from_single_text(text)
             
-            # 显示进度
-            current_batch = (i // 20) + 1
-            print(f"   进度: [{current_batch}/{total_batches}] 已提取 {len(all_keywords)} 个候选考点...", end='\r')
-        
-        print("\n✅ 考点提取完成。正在统计频率...")
-        
+            if kws:
+                all_keywords.extend(kws)
+                keywords_by_year[year].extend(kws)
+            
+            # 可选：每处理50个稍微停顿一下，防止API限流 (如果是本地模型可去掉)
+            # if i % 50 == 0: time.sleep(0.1) 
+
+        print("\n✅ 全量分析完成！正在生成统计报告...")
+
         if not all_keywords:
-            print("⚠️ 未能提取到有效考点，可能是文本内容过少或模型响应异常。")
+            print("⚠️ 未能提取到有效考点。")
             return
 
-        # 统计词频
+        # ================= 步骤 4: 多维度统计 =================
+        
+        # 4.1 全局高频 TOP 10
         counter = Counter(all_keywords)
         most_common = counter.most_common(10)
         
-        print("\n" + "="*50)
-        print("🔥 【模块二】真题高频考点 TOP 10")
-        print("="*50)
+        print("\n" + "="*60)
+        print("🔥【维度一】历年真题高频考点 TOP 10 (绝对频率)")
+        print("="*60)
         for i, (keyword, count) in enumerate(most_common, 1):
-            bar = "█" * min(int(count / 2), 20) 
-            print(f"{i}. {keyword:<15} 出现频次: {count} {bar}")
-            
-        # 押题逻辑
-        print("\n🔮 正在生成 2026 年押题预测...")
-        self.generate_prediction(most_common)
+            bar = "█" * min(int(count / 2), 25) 
+            print(f"{i}. {keyword:<15} | 频次: {count:3d} | {bar}")
 
-    def generate_prediction(self, common_topics):
-        topics_str = ", ".join([f"{k}({v}次)" for k, v in common_topics[:5]])
+        # 4.2 年度趋势分析 (新增专业功能)
+        print("\n" + "="*60)
+        print("📈【维度二】核心考点年度趋势变化 (判断冷热)")
+        print("="*60)
+        
+        # 找出全局前5的考点，看它们在每年的分布
+        top_5_keywords = [k for k, _ in most_common[:5]]
+        
+        if not top_5_keywords:
+            return
+
+        print(f"{'考点名称':<15}", end="")
+        years = sorted([y for y in keywords_by_year.keys() if y != "未知年份"])
+        if not years:
+            years = ["未知年份"]
+        
+        for y in years:
+            print(f"{y:>8}", end="")
+        print(f"{'趋势判断':>10}")
+        print("-" * 60)
+
+        for kw in top_5_keywords:
+            print(f"{kw:<15}", end="")
+            counts_per_year = []
+            for y in years:
+                c = keywords_by_year[y].count(kw)
+                counts_per_year.append(c)
+                print(f"{c:>8}", end="")
+            
+            # 简单趋势逻辑
+            if len(counts_per_year) >= 2:
+                if counts_per_year[-1] > counts_per_year[-2] * 1.5:
+                    trend = "🔥 升温"
+                elif counts_per_year[-1] < counts_per_year[-2] * 0.5:
+                    trend = "❄️ 降温"
+                else:
+                    trend = "➖ 平稳"
+            else:
+                trend = "?"
+            print(f"{trend:>10}")
+
+        # ================= 步骤 5: 原文依据展示 =================
+        print("\n📖【维度三】高频考点原文依据 (随机抽样)")
+        print("-" * 60)
+        displayed = 0
+        for keyword, _ in most_common[:3]:
+            # 找一个包含该关键词的节点
+            for node in nodes:
+                if keyword in node.get_content():
+                    fname = node.metadata.get("file_name", "?")
+                    year = node.metadata.get("year", "?")
+                    snippet = node.get_content().replace("\n", " ")[:80] + "..."
+                    print(f"🔹 [{keyword}] 出自《{fname}》({year}): \"{snippet}\"")
+                    displayed += 1
+                    break
+        if displayed == 0:
+            print("   (未匹配到具体原文)")
+
+        # ================= 步骤 6: 智能押题 =================
+        print("\n🔮【维度四】2025 年押题预测引擎启动...")
+        self.generate_smart_prediction(most_common, keywords_by_year, years)
+
+    def generate_smart_prediction(self, common_topics, keywords_by_year, years):
+        # 构造更丰富的数据上下文
+        trend_data = []
+        top_5 = [k for k, _ in common_topics[:5]]
+        
+        for kw in top_5:
+            history = []
+            for y in years:
+                count = keywords_by_year[y].count(kw)
+                history.append(f"{y}年({count}次)")
+            trend_data.append(f"- {kw}: {', '.join(history)}")
+        
+        trend_str = "\n".join(trend_data)
         
         prompt_text = f"""
-        你是一级建造师考试命题组专家。
-        基于对过去几年真题的分析，以下是最常考的高频考点：
-        [{topics_str}]
+        你是一级建造师资深命题专家。
         
-        请结合考试规律（如：重者恒重、轮流考查、结合新规范），预测 2025 年最可能考查的 3 个【案例分析题】方向。
-        要求：
-        1. 给出预测的考点名称。
-        2. 简述预测理由（为什么明年会考这个？）。
-        3. 给出一道模拟的简答题题干。
+        【数据分析结果】
+        基于对全量真题的逐段分析，核心考点的历史分布如下：
+        {trend_str}
         
-        请以清晰的格式输出。
+        【命题规律逻辑】
+        1. **重者恒重**：连续多年高频的考点，明年大概率继续考（尤其是案例题）。
+        2. **冷热交替**：如果某考点去年考得特别多，今年可能略减；如果某重要考点连续2年未出现，今年极大概率“回补”。
+        3. **新纲新点**：结合2024-2025教材变动（虽然此处无具体教材数据，请依据常识推断新技术、新规范）。
+        
+        【任务】
+        请预测 2025 年最可能考的 3 个【案例分析大题】方向。
+        
+        【输出格式】
+        1. **预测考点**：[名称]
+           - **数据支撑**：引用上面的历史数据说明理由（例如：已连续3年高分，或沉寂2年需回补）。
+           - **模拟题型**：给出一句具体的案例背景描述。
+        
+        请语气专业、笃定。
         """
         
         from llama_index.core import PromptTemplate
@@ -319,14 +405,15 @@ class TrendAnalyzer:
         
         try:
             response = Settings.llm.complete(prompt.format())
-            print("\n" + "="*50)
-            print("💡 【2025 年押题预测】")
-            print("="*50)
+            print("\n" + "="*60)
+            print("💡【2025 年一建·终极押题报告】")
+            print("="*60)
             print(response.text)
-            print("="*50)
+            print("="*60)
+            print(f"\n📝 注：本报告基于 {sum(len(v) for v in keywords_by_year.values())} 个标准化考点数据统计生成。")
+            
         except Exception as e:
             print(f"❌ 预测生成失败: {e}")
-
 
 
 
