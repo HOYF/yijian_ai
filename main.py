@@ -1,5 +1,17 @@
 import os
 
+import pandas as pd
+from collections import Counter, defaultdict
+from tqdm import tqdm
+import time
+
+import sys
+import shutil  # <--- 新增：用于文件复制和删除
+import re
+from pathlib import Path
+
+# 激活虚拟环境 source venv/bin/activate
+
 # 设置 HuggingFace 国内镜像地址
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
@@ -44,6 +56,7 @@ def extract_year_from_filename(file_path: str) -> str:
 
 PERSIST_DIR = "./storage" # 索引保存目录
 
+# 模块一：问答系统
 def build_or_load_knowledge_base():
     """构建知识库，如果已存在则直接加载，节省时间"""
     
@@ -170,11 +183,8 @@ def ask_question(index, query):
         print(f"❌ 生成回答时出错: {e}")
         print("💡 可能是模型响应超时或内容过长，请尝试简化问题。")
 
-import pandas as pd
-from collections import Counter, defaultdict
-from tqdm import tqdm
-import time
 
+# 模块二：考题预测
 class TrendAnalyzer:
     def __init__(self, index):
         self.index = index
@@ -418,6 +428,170 @@ class TrendAnalyzer:
             print(f"❌ 预测生成失败: {e}")
 
 
+# 模块三：私有知识库管理
+class KnowledgeBaseManager:
+    def __init__(self, data_dir="./data", persist_dir="./storage"):
+        self.data_dir = Path(data_dir)
+        self.persist_dir = Path(persist_dir)
+        
+        # 确保 data 目录存在
+        if not self.data_dir.exists():
+            self.data_dir.mkdir(parents=True)
+            print(f"📁 已创建数据目录: {self.data_dir}")
+
+    def list_files(self):
+        """列出当前知识库中的所有文件"""
+        print("\n" + "="*60)
+        print("📂 当前私有知识库文件列表")
+        print("="*60)
+        
+        if not self.data_dir.exists():
+            print("❌ 数据目录不存在。")
+            return
+
+        files = list(self.data_dir.iterdir())
+        # 过滤掉隐藏文件
+        files = [f for f in files if not f.name.startswith('.')]
+        
+        if not files:
+            print("   (空)")
+            return
+
+        print(f"{'文件名':<40} {'大小':<10} {'年份':<8} {'类型'}")
+        print("-" * 60)
+        
+        for f in sorted(files, key=lambda x: x.name):
+            size_mb = f.stat().st_size / 1024 / 1024
+            year = extract_year_from_filename(f.name) # 复用主程序的函数
+            
+            # 简单判断类型
+            f_type = "真题" if "真题" in f.name else ("教材" if "教材" in f.name or "讲义" in f.name else "其他")
+            
+            # 截断长文件名
+            display_name = f.name if len(f.name) <= 38 else f.name[:35] + "..."
+            
+            print(f"{display_name:<40} {size_mb:.2f} MB   {year:<8} {f_type}")
+            
+        print("-" * 60)
+        print(f"💡 总计: {len(files)} 个文件")
+
+    def add_file(self, source_path_str):
+        """添加新文件到知识库"""
+        source_path = Path(source_path_str)
+        
+        if not source_path.exists():
+            print(f"❌ 错误: 找不到文件 '{source_path}'")
+            return False
+        
+        if not source_path.is_file():
+            print(f"❌ 错误: '{source_path}' 不是一个文件")
+            return False
+            
+        # 目标路径
+        dest_path = self.data_dir / source_path.name
+        
+        # 检查是否已存在
+        if dest_path.exists():
+            overwrite = input(f"⚠️ 文件 '{source_path.name}' 已存在，是否覆盖？(y/n): ").strip().lower()
+            if overwrite != 'y':
+                print("❌ 操作取消。")
+                return False
+        
+        try:
+            # 复制文件
+            shutil.copy2(source_path, dest_path)
+            print(f"✅ 成功添加: {source_path.name}")
+            print("⚠️ 注意: 新文件添加后，必须执行 [重建索引] 才能被 AI 检索到！")
+            return True
+        except Exception as e:
+            print(f"❌ 复制失败: {e}")
+            return False
+
+    def delete_file(self, filename):
+        """从知识库删除文件"""
+        target_path = self.data_dir / filename
+        
+        if not target_path.exists():
+            print(f"❌ 错误: 知识库中找不到文件 '{filename}'")
+            return False
+        
+        confirm = input(f"⚠️ 确认要删除 '{filename}' 吗？此操作不可恢复 (y/n): ").strip().lower()
+        if confirm != 'y':
+            print("❌ 操作取消。")
+            return False
+            
+        try:
+            target_path.unlink()
+            print(f"✅ 成功删除: {filename}")
+            print("⚠️ 注意: 文件删除后，必须执行 [重建索引] 才能生效！")
+            return True
+        except Exception as e:
+            print(f"❌ 删除失败: {e}")
+            return False
+
+    def rebuild_index(self):
+        """删除旧索引并重新构建"""
+        print("\n🔄 开始重建索引...")
+        
+        # 1. 删除旧索引目录
+        if self.persist_dir.exists():
+            print(f"🗑️ 正在删除旧索引: {self.persist_dir} ...")
+            try:
+                shutil.rmtree(self.persist_dir)
+                print("   ✅ 旧索引已清除。")
+            except Exception as e:
+                print(f"   ❌ 删除旧索引失败: {e}")
+                print("   💡 请手动删除 ./storage 文件夹后重试。")
+                return False
+        else:
+            print("   ℹ️ 未发现旧索引，将直接构建新索引。")
+
+        # 2. 检查数据目录
+        files = list(self.data_dir.iterdir())
+        files = [f for f in files if not f.name.startswith('.')]
+        
+        if not files:
+            print("❌ 错误: 数据目录为空，无法构建索引。请先添加文件。")
+            return False
+
+        # 3. 重新执行构建逻辑 (复用主程序的逻辑，但这里简化处理)
+        # 为了不重复代码，我们直接调用主程序的 build_or_load_knowledge_base 逻辑
+        # 但由于该函数在全局作用域，我们需要稍微变通一下
+        # 最好的方式是：提示用户重启程序或重新运行构建流程
+        # 这里我们模拟一个简单的重建过程，或者提示用户
+        
+        print("\n" + "="*60)
+        print("🚀 索引重建指引")
+        print("="*60)
+        print("由于向量索引构建涉及复杂的模型加载，为了保证稳定性：")
+        print("1. 程序将自动退出。")
+        print("2. 请重新运行 python main.py。")
+        print("3. 系统会自动检测到索引缺失，并基于最新文件重新构建。")
+        print("="*60)
+        
+        # 如果需要强制在当前进程重建，可以引入 build_or_load_knowledge_base
+        # 但为了避免上下文冲突，推荐重启方式。
+        # 如果用户坚持要在当前进程重建，可以取消下面注释（需确保环境变量一致）
+        
+        # --- 高级选项：尝试在当前进程重建 (可选) ---
+        # print("🔄 正在重新加载文档并构建索引 (这可能需要几分钟)...")
+        # try:
+        #     # 这里需要重新导入 SimpleDirectoryReader 等，略繁琐
+        #     # 建议直接让用户重启，体验更稳定
+        #     pass 
+        # except Exception as e:
+        #     print(f"重建出错: {e}")
+        
+        return True # 返回 True 表示准备就绪，等待重启
+
+# 辅助函数：提取年份 (如果主程序里有了，这里可以不用重复定义，或者直接从全局引用)
+# 为了防止作用域问题，我们在类外部定义一个通用的，或者直接在类里用正则
+def extract_year_from_filename(file_path: str) -> str:
+    match = re.search(r'\d{4}', file_path)
+    return match.group(0) if match else "未知"
+
+
+
 
 if __name__ == "__main__":
     print("🏗️  一建智能备考助手 (本地版) 启动中...")
@@ -428,6 +602,9 @@ if __name__ == "__main__":
     
     # 初始化分析器
     analyzer = TrendAnalyzer(index)
+
+    # 初始化知识库管理器 (新增)
+    kb_manager = KnowledgeBaseManager()
 
     print("-" * 40)
     print("✅ 准备就绪！请选择功能模式：")
@@ -440,7 +617,7 @@ if __name__ == "__main__":
     # 2. 循环提问
     while True:
         try:
-            mode = input("\n👉 请输入模式编号 (1/2/q): ").strip()
+            mode = input("\n👉 请输入模式编号 (1/2/3/q): ").strip()
 
             if mode.lower() == 'q':
                 print("👋 再见，祝备考顺利！")
@@ -460,8 +637,42 @@ if __name__ == "__main__":
                 analyzer.analyze_trends()
                 # 分析完后自动返回主菜单，或者询问是否继续
                 input("\n按回车键返回主菜单...")
+            elif mode == '3':
+                print("--- 进入知识库管理模式 ---")
+                while True:
+                    print("\n请选择操作:")
+                    print("   [a] 添加文件 (输入文件路径)")
+                    print("   [d] 删除文件")
+                    print("   [l] 列出当前文件")
+                    print("   [r] 重建索引 (重要!)")
+                    print("   [b] 返回主菜单")
+                    
+                    sub_mode = input("👉 选择 (a/d/l/r/b): ").strip().lower()
+                    
+                    if sub_mode == 'b':
+                        break
+                    elif sub_mode == 'l':
+                        kb_manager.list_files()
+                    elif sub_mode == 'a':
+                        path = input("👉 请输入新文件的绝对或相对路径: ").strip()
+                        # 处理拖拽文件时可能产生的引号
+                        path = path.strip('"').strip("'")
+                        kb_manager.add_file(path)
+                    elif sub_mode == 'd':
+                        kb_manager.list_files() # 先展示再删除
+                        fname = input("👉 请输入要删除的完整文件名: ").strip()
+                        kb_manager.delete_file(fname)
+                    elif sub_mode == 'r':
+                        kb_manager.rebuild_index()
+                        # 重建索引后，通常需要重启程序才能重新加载 index 对象
+                        # 这里我们直接退出，让用户重新运行
+                        print("\n💡 索引重建准备就绪。为了使更改生效，程序将退出。")
+                        print("请重新运行: python main.py")
+                        sys.exit(0)
+                    else:
+                        print("❌ 无效输入。")
             else:
-                print("❌ 无效输入，请输入 1, 2 或 q")
+                print("❌ 无效输入，请输入 1, 2, 3 或 q")
         except KeyboardInterrupt:
             print("\n👋 强制退出，再见！")
             break
