@@ -1,32 +1,34 @@
 import os
-
 import pandas as pd
 from collections import Counter, defaultdict
 from tqdm import tqdm
 import time
-
 import sys
 import shutil  # <--- 新增：用于文件复制和删除
 import re
 from pathlib import Path
+from llama_index.llms.ollama import Ollama # 连接本地 Ollama
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding # 使用 HF 的嵌入模型
+# 构建过滤器
+from llama_index.core.vector_stores import FilterCondition, MetadataFilter
 
-# 激活虚拟环境 source venv/bin/activate
+from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, Settings, StorageContext, load_index_from_storage, Document, PromptTemplate
+# SimpleDirectoryReader 读取文件夹里的文档
+# VectorStoreIndex 创建向量索引
+# Settings 全局设置
+# StorageContext 存储上下文
+# load_index_from_storage 从磁盘加载已建好的索引
+# Document 文档对象
+# PromptTemplate 提示词模板
+
+
+# 1. 激活虚拟环境 source venv/bin/activate
+# 2. ollama serve 启动本地大模型服务
+# 3. streamlit run app.py 启动智能系统Web应用
 
 # 设置 HuggingFace 国内镜像地址
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
-import sys
-from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, Settings, StorageContext, load_index_from_storage
-
-from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from pathlib import Path
-
-from llama_index.core import Document
-import re
-
-# 构建过滤器
-from llama_index.core.vector_stores import FilterCondition, MetadataFilter
 
 # =================配置区域=================
 
@@ -40,6 +42,7 @@ Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-zh-v1.5")
 # 确保你已经运行过: ollama pull qwen2.5:3b
 print("⚙️ 正在连接本地大模型 (Qwen2.5-3B)...")
 try:
+    # 设置大语言模型：负责思考和生成，context_window=4096 限制了一次性能读多少字，防止爆显存
     Settings.llm = Ollama(model="qwen2.5:3b", request_timeout=120.0, context_window=4096)
 except Exception as e:
     print(f"❌ 连接 Ollama 失败: {e}")
@@ -47,23 +50,24 @@ except Exception as e:
     sys.exit(1)
 
 # =================主程序=================
-
+# 提取年份函数
 def extract_year_from_filename(file_path: str) -> str:
     """从文件名中提取年份，如 '2024 环球网校...' -> '2024'"""
-    match = re.search(r'\d{4}', file_path)
+    match = re.search(r'\d{4}', file_path) # 正则表达式：找连续的4个数字
     return match.group(0) if match else "未知"
 
 
 PERSIST_DIR = "./storage" # 索引保存目录
 
-# 模块一：问答系统
+# 构建和加载知识库
 def build_or_load_knowledge_base():
     """构建知识库，如果已存在则直接加载，节省时间"""
     
-    # 检查是否已经存在建好的索引
+    # 检查是否已经存在建好的索引(加速启动)
     if Path(PERSIST_DIR).exists():
         print("📂 发现已存在的索引，正在快速加载...")
         try:
+            # 从磁盘加载现成的向量数据库，秒开
             storage_context = StorageContext.from_defaults(persist_dir=PERSIST_DIR)
             index = load_index_from_storage(storage_context)
             print("✨ 索引加载完成！")
@@ -82,14 +86,14 @@ def build_or_load_knowledge_base():
         # 读取所有文件
         raw_documents = SimpleDirectoryReader("./data").load_data()
 
-        # 为每个文档添加 metadata（包括年份、文件名等）
+        # 数据清洗与增强 (添加 metadata)，为每个文档添加 metadata（包括年份、文件名等）
         documents = []
         for doc in raw_documents:
             # 获取原始文件路径
             file_path = doc.metadata.get("file_path", "")
             year = extract_year_from_filename(file_path)
 
-            # 创建新文档，附加metadata
+            # 创建新文档对象，附加metadata（注入自定义元数据）
             new_doc = Document(
                 text=doc.text,
                 metadata={
@@ -113,22 +117,26 @@ def build_or_load_knowledge_base():
     print(f"✅ 成功加载 {len(documents)} 个文档片段。")
     print("🔄 正在建立向量索引 (首次运行可能需要几分钟，请耐心等待)...")
     
-    # 创建向量索引
+    # 建立向量索引 (最耗时的步骤)
+    # 过程：文本切分 -> 调用 embed_model 转向量 -> 存入内存/磁盘
+    # 关键点：VectorStoreIndex.from_documents 内部会自动把长文档切成小块 (Chunks)，然后每一块都调用嵌入模型生成向量
     index = VectorStoreIndex.from_documents(documents)
     
-    # 保存到磁盘，下次不用重新算
+    # 保存到磁盘，下次不用重新算(存到 ./storage 文件夹)
     index.storage_context.persist(persist_dir=PERSIST_DIR)
     print(f"💾 索引已保存至 '{PERSIST_DIR}' 文件夹。")
     print("✨ 知识库构建完成！")
     
     return index
 
+# 模块一问答功能
 def ask_question(index, query):
     """执行查询"""
     # 创建查询引擎
     # similarity_top_k=5 表示参考最相关的 5 段内容
     # query_engine = index.as_query_engine(similarity_top_k=5)
     """执行查询 (带流式输出) - 支持按年份过滤"""
+    # 1. 解析用户是否想要特定年份 (正则匹配)
     year_match = re.search(r'\b(20\d{2})\b', query)
     target_year = year_match.group(1) if year_match else None
 
@@ -136,6 +144,7 @@ def ask_question(index, query):
     if target_year:
         print(f"🔍 正在筛选 {target_year} 年的相关资料...")
 
+    # 2. 构建过滤器 
     filters = None
     if target_year:
         filters = MetadataFilter.from_dict(
@@ -144,11 +153,11 @@ def ask_question(index, query):
             operator="=="
         )
     
-    # 创建查询引擎，传入过滤器，开启 streaming
+    # 3. 创建查询引擎，传入过滤器
     query_engine = index.as_query_engine(
         similarity_top_k=5,
         filters=filters,  # 👈 关键：只检索匹配年份的文档
-        streaming=True
+        streaming=True # 开启流输出（字一个个蹦出来）
     )
 
 
@@ -156,6 +165,7 @@ def ask_question(index, query):
     
     # print(f"\n🤖 思考中: {query} ...")
     try:
+        # 执行查询
         response = query_engine.query(query)
         
         print(f"\n💡 AI 回答:")
@@ -165,7 +175,7 @@ def ask_question(index, query):
         print() # 换行
 
 
-        # 显示引用来源
+        # 显示引用来源（RAG 的核心：可追溯）
         if response.source_nodes:
             print("\n📖 依据来源:")
             for i, node in enumerate(response.source_nodes):
@@ -188,7 +198,9 @@ def ask_question(index, query):
 class TrendAnalyzer:
     def __init__(self, index):
         self.index = index
-
+    
+    # 构造一个 Prompt，让 LLM 充当“命题专家”，从一段真题文本中提取标准术语（如“网络计划”）
+    # 注意：这里是对每一个文本片段单独调用 LLM，所以比较慢，但非常精准
     def extract_keywords_from_single_text(self, text):
         """
         【核心升级】对单段文本进行标准化考点提取
@@ -212,7 +224,7 @@ class TrendAnalyzer:
         """
         # 上面要求最多提取2个考点，而且限制了文字长度，所以还是不够精准；
         
-        from llama_index.core import PromptTemplate
+        
         prompt = PromptTemplate(prompt_text)
         
         try:
@@ -224,6 +236,12 @@ class TrendAnalyzer:
         except Exception as e:
             return []
 
+    # Step 1: 用过滤器 source_type=="真题" 捞出所有真题片段。
+    # Step 2: 统计文件来源，展示数据透明度
+    # Step 3 (Map): 循环遍历所有节点，逐个提取关键词。使用 tqdm 显示进度条。
+    # Step 4 (Reduce): 使用 Counter 统计词频，找出 TOP 10
+    # Step 5: 按年份分组，计算趋势（升温/降温）
+    # Step 6: 再次调用 LLM，把统计好的数据喂给它，让它写押题报告。
     def analyze_trends(self):
         print("\n📊 正在启动【专业版】真题趋势分析引擎...")
         print("⚠️ 注意：为了保证全面性，系统将逐段分析所有真题，这可能需要 2-3 分钟，请耐心等待...\n")
@@ -475,6 +493,7 @@ class KnowledgeBaseManager:
         print("-" * 60)
         print(f"💡 总计: {len(files)} 个文件")
 
+    # 复制文件
     def add_file(self, source_path_str):
         """添加新文件到知识库"""
         source_path = Path(source_path_str)
@@ -506,7 +525,8 @@ class KnowledgeBaseManager:
         except Exception as e:
             print(f"❌ 复制失败: {e}")
             return False
-
+    
+    # 删除文件
     def delete_file(self, filename):
         """从知识库删除文件"""
         target_path = self.data_dir / filename
@@ -529,6 +549,7 @@ class KnowledgeBaseManager:
             print(f"❌ 删除失败: {e}")
             return False
 
+    # 删除 ./storage 文件夹
     def rebuild_index(self):
         """删除旧索引并重新构建"""
         print("\n🔄 开始重建索引...")
